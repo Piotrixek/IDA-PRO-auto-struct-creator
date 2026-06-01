@@ -22,13 +22,18 @@ def get_safe_size(t):
         return 1
     return sz
 
-def get_add_offset(unstripped_ptr_expr, num_expr):
-    sz = unstripped_ptr_expr.type.get_ptrarr_objsize()
+def get_add_offset(node, num_node):
+    if node.op == ida_hexrays.cot_add:
+        sz = node.type.get_ptrarr_objsize()
+    elif node.op == ida_hexrays.cot_idx:
+        sz = node.x.type.get_ptrarr_objsize()
+    else:
+        sz = 1
+        
     if sz == ida_typeinf.BADSIZE or sz <= 0:
-        sz = strip_casts(unstripped_ptr_expr).type.get_ptrarr_objsize()
-        if sz == ida_typeinf.BADSIZE or sz <= 0:
-            sz = 1
-    val = num_expr.n._value
+        sz = 1
+        
+    val = num_node.n._value
     if val > 0x7FFFFFFFFFFFFFFF:
         val -= 0x10000000000000000
     return val * sz
@@ -36,6 +41,7 @@ def get_add_offset(unstripped_ptr_expr, num_expr):
 class DisjointSet:
     def __init__(self):
         self.p = {}
+        
     def find(self, i):
         if i not in self.p:
             self.p[i] = i
@@ -43,6 +49,7 @@ class DisjointSet:
             return i
         self.p[i] = self.find(self.p[i])
         return self.p[i]
+        
     def union(self, i, j):
         ri = self.find(i)
         rj = self.find(j)
@@ -63,109 +70,103 @@ class ASTScanner(ida_hexrays.ctree_visitor_t):
             func = strip_casts(e.x)
             if func.op == ida_hexrays.cot_ptr:
                 addr = strip_casts(func.x)
+                vptr = None
                 if addr.op == ida_hexrays.cot_add:
                     vptr = strip_casts(addr.x)
-                    if vptr.op == ida_hexrays.cot_ptr:
-                        obj = strip_casts(vptr.x)
-                        if obj.op == ida_hexrays.cot_var:
-                            self.scalars.append((obj.v.idx, 0, 8))
-                            self.forced_names[(obj.v.idx, 0)] = "vtable"
+                elif addr.op == ida_hexrays.cot_ptr:
+                    vptr = addr
+                    
+                if vptr and vptr.op == ida_hexrays.cot_ptr:
+                    obj = strip_casts(vptr.x)
+                    if obj.op == ida_hexrays.cot_var:
+                        self.scalars.append((obj.v.idx, 0, 8))
+                        self.forced_names[(obj.v.idx, 0)] = "vftable"
 
         if e.op == ida_hexrays.cot_asg:
             lhs = strip_casts(e.x)
             rhs = strip_casts(e.y)
+            
             if lhs.op == ida_hexrays.cot_var:
                 v_dst = lhs.v.idx
+                
                 if rhs.op == ida_hexrays.cot_var:
                     self.uf.union(v_dst, rhs.v.idx)
+                    
                 elif rhs.op == ida_hexrays.cot_add:
                     a1 = strip_casts(rhs.x)
                     a2 = strip_casts(rhs.y)
                     if a1.op == ida_hexrays.cot_var and a2.op == ida_hexrays.cot_num:
-                        self.inline_rels.append((v_dst, a1.v.idx, get_add_offset(rhs.x, a2)))
+                        self.inline_rels.append((v_dst, a1.v.idx, get_add_offset(rhs, a2)))
+                        
                 elif rhs.op == ida_hexrays.cot_ref:
                     obj = strip_casts(rhs.x)
                     if obj.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
                         base = strip_casts(obj.x)
                         if base.op == ida_hexrays.cot_var:
                             self.inline_rels.append((v_dst, base.v.idx, obj.m))
+                            
                 elif rhs.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
                     base = strip_casts(rhs.x)
                     if base.op == ida_hexrays.cot_var:
                         self.ptr_rels.append((v_dst, base.v.idx, rhs.m))
+                        
                 elif rhs.op == ida_hexrays.cot_ptr:
                     obj = strip_casts(rhs.x)
                     if obj.op == ida_hexrays.cot_add:
                         a1 = strip_casts(obj.x)
                         a2 = strip_casts(obj.y)
                         if a1.op == ida_hexrays.cot_var and a2.op == ida_hexrays.cot_num:
-                            self.ptr_rels.append((v_dst, a1.v.idx, get_add_offset(obj.x, a2)))
+                            self.ptr_rels.append((v_dst, a1.v.idx, get_add_offset(obj, a2)))
                     elif obj.op == ida_hexrays.cot_var:
                         self.ptr_rels.append((v_dst, obj.v.idx, 0))
+                        
                 elif rhs.op == ida_hexrays.cot_idx:
                     a1 = strip_casts(rhs.x)
                     a2 = strip_casts(rhs.y)
                     if a1.op == ida_hexrays.cot_var and a2.op == ida_hexrays.cot_num:
-                        self.ptr_rels.append((v_dst, a1.v.idx, get_add_offset(rhs.x, a2)))
+                        self.ptr_rels.append((v_dst, a1.v.idx, get_add_offset(rhs, a2)))
+
+            elif lhs.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
+                base = strip_casts(lhs.x)
+                if base.op == ida_hexrays.cot_var and rhs.op == ida_hexrays.cot_var:
+                    self.ptr_rels.append((rhs.v.idx, base.v.idx, lhs.m))
+                    
+            elif lhs.op == ida_hexrays.cot_ptr:
+                obj = strip_casts(lhs.x)
+                if obj.op == ida_hexrays.cot_add:
+                    a1 = strip_casts(obj.x)
+                    a2 = strip_casts(obj.y)
+                    if a1.op == ida_hexrays.cot_var and a2.op == ida_hexrays.cot_num and rhs.op == ida_hexrays.cot_var:
+                        self.ptr_rels.append((rhs.v.idx, a1.v.idx, get_add_offset(obj, a2)))
+                elif obj.op == ida_hexrays.cot_var and rhs.op == ida_hexrays.cot_var:
+                    self.ptr_rels.append((rhs.v.idx, obj.v.idx, 0))
 
         if e.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
             obj = strip_casts(e.x)
             if obj.op == ida_hexrays.cot_var:
                 self.scalars.append((obj.v.idx, e.m, get_safe_size(e.type)))
+                
         elif e.op == ida_hexrays.cot_ptr:
             obj = strip_casts(e.x)
             if obj.op == ida_hexrays.cot_add:
                 a1 = strip_casts(obj.x)
                 a2 = strip_casts(obj.y)
                 if a1.op == ida_hexrays.cot_var and a2.op == ida_hexrays.cot_num:
-                    self.scalars.append((a1.v.idx, get_add_offset(obj.x, a2), get_safe_size(e.type)))
+                    self.scalars.append((a1.v.idx, get_add_offset(obj, a2), get_safe_size(e.type)))
             elif obj.op == ida_hexrays.cot_var:
                 self.scalars.append((obj.v.idx, 0, get_safe_size(e.type)))
+                
         elif e.op == ida_hexrays.cot_idx:
             a1 = strip_casts(e.x)
             a2 = strip_casts(e.y)
             if a1.op == ida_hexrays.cot_var and a2.op == ida_hexrays.cot_num:
-                self.scalars.append((a1.v.idx, get_add_offset(e.x, a2), get_safe_size(e.type)))
+                self.scalars.append((a1.v.idx, get_add_offset(e, a2), get_safe_size(e.type)))
+                
         return 0
 
 def process_cfunc(cfunc):
     scanner = ASTScanner()
     scanner.apply_to(cfunc.body, None)
-
-    p_inline = {}
-    p_ptr = {}
-
-    for c, p, off in scanner.inline_rels:
-        if off < 0 or off > 0x10000:
-            continue
-        cr = scanner.uf.find(c)
-        pr = scanner.uf.find(p)
-        key = (pr, off)
-        if key in p_inline:
-            scanner.uf.union(cr, p_inline[key])
-        else:
-            p_inline[key] = cr
-
-    for c, p, off in scanner.ptr_rels:
-        if off < 0 or off > 0x10000:
-            continue
-        cr = scanner.uf.find(c)
-        pr = scanner.uf.find(p)
-        key = (pr, off)
-        if key in p_ptr:
-            scanner.uf.union(cr, p_ptr[key])
-        else:
-            p_ptr[key] = cr
-
-    f_inline = {}
-    for c, p, off in scanner.inline_rels:
-        if 0 <= off <= 0x10000:
-            f_inline[(scanner.uf.find(p), off)] = scanner.uf.find(c)
-
-    f_ptr = {}
-    for c, p, off in scanner.ptr_rels:
-        if 0 <= off <= 0x10000:
-            f_ptr[(scanner.uf.find(p), off)] = scanner.uf.find(c)
 
     ledgers = {}
     for v, off, size in scanner.scalars:
@@ -178,16 +179,57 @@ def process_cfunc(cfunc):
             off = off & ~(size - 1)
         ledgers[r].add((off, size))
 
+    proven_roots = set(ledgers.keys())
+    for c, p, off in scanner.inline_rels:
+        proven_roots.add(scanner.uf.find(p))
+    for c, p, off in scanner.ptr_rels:
+        proven_roots.add(scanner.uf.find(p))
+
+    inline_rels_filtered = [r for r in scanner.inline_rels if scanner.uf.find(r[0]) in proven_roots]
+    ptr_rels_filtered = [r for r in scanner.ptr_rels if scanner.uf.find(r[0]) in proven_roots]
+
+    p_inline = {}
+    p_ptr = {}
+
+    for c, p, off in inline_rels_filtered:
+        if off < 0 or off > 0x10000:
+            continue
+        cr = scanner.uf.find(c)
+        pr = scanner.uf.find(p)
+        key = (pr, off)
+        if key in p_inline:
+            scanner.uf.union(cr, p_inline[key])
+        else:
+            p_inline[key] = cr
+
+    for c, p, off in ptr_rels_filtered:
+        if off < 0 or off > 0x10000:
+            continue
+        cr = scanner.uf.find(c)
+        pr = scanner.uf.find(p)
+        key = (pr, off)
+        if key in p_ptr:
+            scanner.uf.union(cr, p_ptr[key])
+        else:
+            p_ptr[key] = cr
+
+    f_inline = {}
+    for c, p, off in inline_rels_filtered:
+        if 0 <= off <= 0x10000:
+            f_inline[(scanner.uf.find(p), off)] = scanner.uf.find(c)
+
+    f_ptr = {}
+    for c, p, off in ptr_rels_filtered:
+        if 0 <= off <= 0x10000:
+            f_ptr[(scanner.uf.find(p), off)] = scanner.uf.find(c)
+
+    forced_names_resolved = {}
+    for (var_idx, off), name in scanner.forced_names.items():
+        root = scanner.uf.find(var_idx)
+        forced_names_resolved[(root, off)] = name
+
     lvars = cfunc.get_lvars()
-    all_roots = set()
-    for (p, o), c in f_inline.items():
-        all_roots.add(p)
-        all_roots.add(c)
-    for (p, o), c in f_ptr.items():
-        all_roots.add(p)
-        all_roots.add(c)
-    for r in ledgers.keys():
-        all_roots.add(r)
+    all_roots = proven_roots
 
     struct_names = { r: f"auto_struc_{lvars[r].name}" for r in all_roots }
 
@@ -210,6 +252,7 @@ def process_cfunc(cfunc):
     built = set()
     for root in order:
         fields = []
+        
         for (p, off), c in f_inline.items():
             if p == root:
                 tif = ida_typeinf.tinfo_t()
@@ -241,7 +284,7 @@ def process_cfunc(cfunc):
                     elif sz == 4: mt = ida_typeinf.BTF_UINT32
                     elif sz == 8: mt = ida_typeinf.BTF_UINT64
                     else: mt = ida_typeinf.BTF_BYTE
-                    name = scanner.forced_names.get((root, off), f"field_{off:X}")
+                    name = forced_names_resolved.get((root, off), f"field_{off:X}")
                     fields.append((off, sz, ida_typeinf.tinfo_t(mt), name))
 
         if not fields:
