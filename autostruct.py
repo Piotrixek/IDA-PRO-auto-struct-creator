@@ -26,7 +26,7 @@ def get_add_offset(node, num_node):
     if node.op == ida_hexrays.cot_add:
         sz = node.type.get_ptrarr_objsize()
     elif node.op == ida_hexrays.cot_idx:
-        sz = node.x.type.get_ptrarr_objsize()
+        sz = node.type.get_size()
     else:
         sz = 1
         
@@ -64,8 +64,32 @@ class ASTScanner(ida_hexrays.ctree_visitor_t):
         self.ptr_rels = []
         self.scalars = []
         self.forced_names = {}
+        self.blacklisted_ptr_offsets = set()
 
     def visit_expr(self, e):
+        ops_scalar_context = (
+            ida_hexrays.cot_eq, ida_hexrays.cot_ne, ida_hexrays.cot_sge,
+            ida_hexrays.cot_sle, ida_hexrays.cot_sgt, ida_hexrays.cot_slt,
+            ida_hexrays.cot_uge, ida_hexrays.cot_ule, ida_hexrays.cot_ugt,
+            ida_hexrays.cot_ult, ida_hexrays.cot_add, ida_hexrays.cot_sub,
+            ida_hexrays.cot_mul, ida_hexrays.cot_sdiv, ida_hexrays.cot_udiv,
+            ida_hexrays.cot_band, ida_hexrays.cot_bor, ida_hexrays.cot_xor
+        )
+        
+        if e.op in ops_scalar_context:
+            for side in (e.x, e.y):
+                if not side.type.is_ptr():
+                    stripped = strip_casts(side)
+                    if stripped.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
+                        base = strip_casts(stripped.x)
+                        if base.op == ida_hexrays.cot_var:
+                            self.blacklisted_ptr_offsets.add((base.v.idx, stripped.m))
+                    elif stripped.op == ida_hexrays.cot_idx:
+                        a1 = strip_casts(stripped.x)
+                        a2 = strip_casts(stripped.y)
+                        if a1.op == ida_hexrays.cot_var and a2.op == ida_hexrays.cot_num:
+                            self.blacklisted_ptr_offsets.add((a1.v.idx, get_add_offset(stripped, a2)))
+
         if e.op == ida_hexrays.cot_call:
             func = strip_casts(e.x)
             if func.op == ida_hexrays.cot_ptr:
@@ -88,28 +112,23 @@ class ASTScanner(ida_hexrays.ctree_visitor_t):
             
             if lhs.op == ida_hexrays.cot_var:
                 v_dst = lhs.v.idx
-                
                 if rhs.op == ida_hexrays.cot_var:
                     self.uf.union(v_dst, rhs.v.idx)
-                    
                 elif rhs.op == ida_hexrays.cot_add:
                     a1 = strip_casts(rhs.x)
                     a2 = strip_casts(rhs.y)
                     if a1.op == ida_hexrays.cot_var and a2.op == ida_hexrays.cot_num:
                         self.inline_rels.append((v_dst, a1.v.idx, get_add_offset(rhs, a2)))
-                        
                 elif rhs.op == ida_hexrays.cot_ref:
                     obj = strip_casts(rhs.x)
                     if obj.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
                         base = strip_casts(obj.x)
                         if base.op == ida_hexrays.cot_var:
                             self.inline_rels.append((v_dst, base.v.idx, obj.m))
-                            
                 elif rhs.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
                     base = strip_casts(rhs.x)
                     if base.op == ida_hexrays.cot_var:
                         self.ptr_rels.append((v_dst, base.v.idx, rhs.m))
-                        
                 elif rhs.op == ida_hexrays.cot_ptr:
                     obj = strip_casts(rhs.x)
                     if obj.op == ida_hexrays.cot_add:
@@ -119,7 +138,6 @@ class ASTScanner(ida_hexrays.ctree_visitor_t):
                             self.ptr_rels.append((v_dst, a1.v.idx, get_add_offset(obj, a2)))
                     elif obj.op == ida_hexrays.cot_var:
                         self.ptr_rels.append((v_dst, obj.v.idx, 0))
-                        
                 elif rhs.op == ida_hexrays.cot_idx:
                     a1 = strip_casts(rhs.x)
                     a2 = strip_casts(rhs.y)
@@ -130,6 +148,12 @@ class ASTScanner(ida_hexrays.ctree_visitor_t):
                 base = strip_casts(lhs.x)
                 if base.op == ida_hexrays.cot_var and rhs.op == ida_hexrays.cot_var:
                     self.ptr_rels.append((rhs.v.idx, base.v.idx, lhs.m))
+                    
+            elif lhs.op == ida_hexrays.cot_idx:
+                base = strip_casts(lhs.x)
+                idx = strip_casts(lhs.y)
+                if base.op == ida_hexrays.cot_var and idx.op == ida_hexrays.cot_num and rhs.op == ida_hexrays.cot_var:
+                    self.ptr_rels.append((rhs.v.idx, base.v.idx, get_add_offset(lhs, idx)))
                     
             elif lhs.op == ida_hexrays.cot_ptr:
                 obj = strip_casts(lhs.x)
@@ -184,9 +208,13 @@ def process_cfunc(cfunc):
         proven_roots.add(scanner.uf.find(p))
     for c, p, off in scanner.ptr_rels:
         proven_roots.add(scanner.uf.find(p))
+        
+    resolved_blacklist = set()
+    for var_idx, off in scanner.blacklisted_ptr_offsets:
+        resolved_blacklist.add((scanner.uf.find(var_idx), off))
 
-    inline_rels_filtered = [r for r in scanner.inline_rels if scanner.uf.find(r[0]) in proven_roots]
-    ptr_rels_filtered = [r for r in scanner.ptr_rels if scanner.uf.find(r[0]) in proven_roots]
+    inline_rels_filtered = [r for r in scanner.inline_rels if scanner.uf.find(r[0]) in proven_roots and (scanner.uf.find(r[1]), r[2]) not in resolved_blacklist]
+    ptr_rels_filtered = [r for r in scanner.ptr_rels if scanner.uf.find(r[0]) in proven_roots and (scanner.uf.find(r[1]), r[2]) not in resolved_blacklist]
 
     p_inline = {}
     p_ptr = {}
